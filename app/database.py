@@ -293,6 +293,45 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+CREATE TABLE IF NOT EXISTS compute_class_policies (
+    project_code TEXT PRIMARY KEY,
+    weight INTEGER NOT NULL DEFAULT 100 CHECK(weight BETWEEN 1 AND 1000),
+    max_concurrent INTEGER NOT NULL DEFAULT 100000 CHECK(max_concurrent >= 0),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    note TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compute_schedule_config (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    aging_step_seconds INTEGER NOT NULL CHECK(aging_step_seconds BETWEEN 10 AND 86400),
+    aging_bonus_per_step INTEGER NOT NULL CHECK(aging_bonus_per_step >= 0),
+    max_age_bonus INTEGER NOT NULL CHECK(max_age_bonus >= 0),
+    default_weight INTEGER NOT NULL CHECK(default_weight BETWEEN 1 AND 1000),
+    default_max_concurrent INTEGER NOT NULL CHECK(default_max_concurrent >= 0),
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compute_claim_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('claimed','skipped','empty')),
+    selected_task_id INTEGER,
+    lease_expires_at TEXT NOT NULL DEFAULT '',
+    total_available INTEGER NOT NULL DEFAULT 0,
+    scanned_count INTEGER NOT NULL DEFAULT 0,
+    config_json TEXT NOT NULL,
+    policies_json TEXT NOT NULL,
+    running_counts_json TEXT NOT NULL,
+    project_quotas_json TEXT NOT NULL,
+    evaluated_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_compute_claim_decisions_created ON compute_claim_decisions(created_at DESC,id);
 '''
 
 PERMISSIONS = [

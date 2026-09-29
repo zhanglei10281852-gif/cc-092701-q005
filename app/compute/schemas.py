@@ -23,6 +23,22 @@ class QuotaSet(BaseModel):
     daily_submissions: int = Field(default=200, ge=0, le=1000000)
 
 
+class ClassPolicySet(BaseModel):
+    project_code: str = Field(min_length=1, max_length=80)
+    weight: int = Field(default=100, ge=1, le=1000)
+    max_concurrent: int = Field(default=100_000, ge=0, le=100_000)
+    is_active: bool = True
+    note: str = Field(default="", max_length=500)
+
+
+class ScheduleConfigUpdate(BaseModel):
+    aging_step_seconds: int | None = Field(default=None, ge=10, le=86_400)
+    aging_bonus_per_step: int | None = Field(default=None, ge=0, le=10_000)
+    max_age_bonus: int | None = Field(default=None, ge=0, le=100_000)
+    default_weight: int | None = Field(default=None, ge=1, le=1000)
+    default_max_concurrent: int | None = Field(default=None, ge=0, le=100_000)
+
+
 class TaskSubmit(BaseModel):
     template_code: str = Field(min_length=2, max_length=64)
     project_code: str = Field(min_length=1, max_length=80)

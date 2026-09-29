@@ -105,13 +105,13 @@ def test_failure_backoff_and_expired_lease_recovery(client):
     service.create_template(TEMPLATE, "administrator")
     first = service.submit(submit_payload("failure-000001"))
     claimed = service.claim("worker-a", ["solver-a"], 10)
-    assert claimed and claimed["id"] == first["id"]
+    assert claimed["task"] and claimed["task"]["id"] == first["id"]
     failed = service.fail(first["id"], "worker-a", "numeric_error", "数值不收敛", True)
     assert failed["status"] == "queued"
     assert failed["available_at"] > failed["updated_at"]
     clock.advance(seconds=2)
     claimed_again = service.claim("worker-a", ["solver-a"], 10)
-    assert claimed_again and claimed_again["attempt_count"] == 2
+    assert claimed_again["task"] and claimed_again["task"]["attempt_count"] == 2
     clock.advance(seconds=11)
     recovered = service.recover_expired()
     assert recovered["exhausted"] == [first["id"]]

@@ -7,6 +7,17 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from app.compute.repository import ComputeRepository
+from app.compute.scheduling import (
+    DEFAULT_CONFIG,
+    OUTCOME_CLAIMED,
+    OUTCOME_EMPTY,
+    OUTCOME_SKIPPED,
+    SCAN_LIMIT,
+    SKIP_CAPABILITY_MISMATCH,
+    choose_task,
+    normalize_config,
+    resolve_policy,
+)
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
@@ -15,6 +26,10 @@ from app.database import get_connection, transaction
 def digest(value: Any) -> str:
     text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+# 扫描窗口内每个班级至少保留的候选数，配合全局排序窗口防止大班挤掉小班。
+PER_CLASS_SCAN = 20
 
 
 class ComputeOperationsService:
@@ -82,22 +97,141 @@ class ComputeOperationsService:
         result["interventions"] = self.repository.interventions(task_id)
         return result
 
-    def claim(self, worker_id: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any] | None:
+    def claim(self, worker_id: str, capabilities: list[str], lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
+        capability_list = sorted(set(capabilities))
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            candidate = repository.queued_candidate(capabilities, now)
-            if candidate is None:
-                return None
-            cursor = connection.execute(
-                "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
-                (worker_id, lease_until, now, now, candidate["id"]),
+            config = normalize_config(
+                repository.ensure_schedule_config(DEFAULT_CONFIG, actor="system", now=now)
             )
-            if cursor.rowcount != 1:
-                return None
-            return dict(repository.task_by_id(candidate["id"]))
+            explicit_rows = repository.list_class_policies()
+            explicit_policies = {row["project_code"]: row for row in explicit_rows}
+            running_counts = repository.running_counts_by_project()
+            candidates, matched_total, due_total = repository.queued_candidates(
+                capability_list, now, scan_limit=SCAN_LIMIT, per_class_limit=PER_CLASS_SCAN
+            )
+            choice = choose_task(
+                candidates,
+                decided_at=now,
+                config=config,
+                explicit_policies=explicit_policies,
+                running_counts=running_counts,
+            )
+            rejections = [
+                {
+                    "task_id": int(row["id"]),
+                    "project_code": str(row["project_code"]),
+                    "template_algorithm": str(row["template_algorithm"]),
+                    "decision": "skipped",
+                    "skip_reason": SKIP_CAPABILITY_MISMATCH,
+                }
+                for row in repository.queued_capability_rejections(capability_list, now, SCAN_LIMIT)
+            ]
+
+            selected = choice["selected"]
+            selected_task_id: int | None = None
+            task: dict[str, Any] | None = None
+            stale = False
+            if selected is not None:
+                cursor = connection.execute(
+                    "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
+                    (worker_id, lease_until, now, now, selected["id"]),
+                )
+                if cursor.rowcount == 1:
+                    selected_task_id = int(selected["id"])
+                    task = dict(repository.task_by_id(selected["id"]))
+                else:
+                    stale = True
+
+            if selected_task_id is not None:
+                outcome = OUTCOME_CLAIMED
+            elif due_total == 0:
+                outcome = OUTCOME_EMPTY
+            else:
+                outcome = OUTCOME_SKIPPED
+
+            involved_projects = {item["project_code"] for item in choice["evaluated"]}
+            involved_projects.update(item["project_code"] for item in rejections)
+            policies_snapshot = {
+                project_code: resolve_policy(project_code, explicit_policies, config).as_audit()
+                for project_code in sorted(involved_projects | set(explicit_policies))
+            }
+            decision_id = repository.add_claim_decision(
+                {
+                    "worker_id": worker_id,
+                    "capabilities": capability_list,
+                    "decided_at": now,
+                    "outcome": outcome,
+                    "selected_task_id": selected_task_id,
+                    "lease_expires_at": lease_until if selected_task_id is not None else "",
+                    "total_available": matched_total,
+                    "scanned_count": choice["scanned"],
+                    "config": config,
+                    "policies": policies_snapshot,
+                    "running_counts": dict(sorted(running_counts.items())),
+                    "project_quotas": repository.quotas_by_type("project"),
+                    "evaluated": {
+                        "scanned": choice["evaluated"],
+                        "capability_rejections": rejections,
+                        "stale_candidate": stale,
+                        "matched_total": matched_total,
+                        "due_total": due_total,
+                    },
+                    "created_at": now,
+                }
+            )
+            return {"task": task, "decision_id": decision_id, "outcome": outcome}
+
+    def list_class_policies(self) -> list[dict[str, Any]]:
+        return self.repository.list_class_policies()
+
+    def set_class_policy(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            return ComputeRepository(connection).upsert_class_policy(actor=actor, now=now, **payload)
+
+    def schedule_config(self) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            return repository.ensure_schedule_config(DEFAULT_CONFIG, actor="system", now=now)
+
+    def set_schedule_config(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = ComputeRepository(connection)
+            current = repository.ensure_schedule_config(DEFAULT_CONFIG, actor="system", now=now)
+            merged = {key: int(current[key]) for key in DEFAULT_CONFIG}
+            for key, value in payload.items():
+                if value is not None:
+                    merged[key] = int(value)
+            self._validate_schedule_config(merged)
+            return repository.upsert_schedule_config(actor=actor, now=now, **merged)
+
+    def list_claim_decisions(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self.repository.claim_decisions(limit=limit)
+
+    def get_claim_decision(self, decision_id: int) -> dict[str, Any]:
+        row = self.repository.claim_decision(decision_id)
+        if row is None:
+            raise NotFoundError("领取决策记录不存在")
+        return row
+
+    @staticmethod
+    def _validate_schedule_config(config: dict[str, int]) -> None:
+        if not 10 <= config["aging_step_seconds"] <= 86_400:
+            raise ValidationError("老化步长必须在 10 到 86400 秒之间")
+        if config["aging_bonus_per_step"] < 0:
+            raise ValidationError("每步老化加分不能为负")
+        if config["max_age_bonus"] < 0:
+            raise ValidationError("老化加分上限不能为负")
+        if not 1 <= config["default_weight"] <= 1000:
+            raise ValidationError("默认班级权重必须在 1 到 1000 之间")
+        if config["default_max_concurrent"] < 0:
+            raise ValidationError("默认并发份额不能为负")
 
     def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()

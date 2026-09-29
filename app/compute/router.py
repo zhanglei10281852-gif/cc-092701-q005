@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchOperation, CancelRequest, ClassPolicySet, PriorityRequest, QuotaSet, RetryRequest, ScheduleConfigUpdate, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -27,6 +27,36 @@ def set_quota(payload: QuotaSet, actor: str = Query(..., min_length=1)):
     return service().set_quota(payload.model_dump(), actor)
 
 
+@router.get("/class-policies")
+def list_class_policies():
+    return {"items": service().list_class_policies()}
+
+
+@router.put("/class-policies")
+def set_class_policy(payload: ClassPolicySet, actor: str = Query(..., min_length=1)):
+    return service().set_class_policy(payload.model_dump(), actor)
+
+
+@router.get("/schedule-config")
+def get_schedule_config():
+    return service().schedule_config()
+
+
+@router.put("/schedule-config")
+def set_schedule_config(payload: ScheduleConfigUpdate, actor: str = Query(..., min_length=1)):
+    return service().set_schedule_config(payload.model_dump(exclude_unset=True), actor)
+
+
+@router.get("/claim-decisions")
+def list_claim_decisions(limit: int = Query(default=50, ge=1, le=500)):
+    return {"items": service().list_claim_decisions(limit=limit)}
+
+
+@router.get("/claim-decisions/{decision_id}")
+def get_claim_decision(decision_id: int):
+    return service().get_claim_decision(decision_id)
+
+
 @router.post("/tasks", status_code=202)
 def submit_task(payload: TaskSubmit):
     return service().submit(payload.model_dump())
@@ -44,7 +74,7 @@ def get_task(task_id: int):
 
 @router.post("/tasks/claim")
 def claim_task(payload: TaskClaim):
-    return {"task": service().claim(payload.worker_id, payload.capabilities, payload.lease_seconds)}
+    return service().claim(payload.worker_id, payload.capabilities, payload.lease_seconds)
 
 
 @router.post("/tasks/{task_id}/heartbeat")
