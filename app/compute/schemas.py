@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TemplateCreate(BaseModel):
@@ -36,6 +36,31 @@ class TaskClaim(BaseModel):
     worker_id: str = Field(min_length=1, max_length=120)
     capabilities: list[str] = Field(default_factory=list, max_length=100)
     lease_seconds: int = Field(default=60, ge=5, le=3600)
+
+
+class ClassSchedulingRule(BaseModel):
+    weight: float | None = Field(default=None, gt=0, le=1000)
+    max_concurrent: int | None = Field(default=None, ge=0, le=100000)
+
+
+class SchedulingPolicySet(BaseModel):
+    """完整的调度策略快照；每次提交生成一个新版本，只影响后续领取决策。"""
+
+    default_weight: float = Field(default=1.0, gt=0, le=1000)
+    default_max_concurrent: int | None = Field(default=None, ge=0, le=100000)
+    aging_rate_per_hour: float = Field(default=1.0, ge=0, le=10000)
+    aging_max_bonus: float = Field(default=100.0, ge=0, le=100000)
+    classes: dict[str, ClassSchedulingRule] = Field(default_factory=dict)
+
+    @field_validator("classes")
+    @classmethod
+    def validate_class_codes(cls, value: dict[str, ClassSchedulingRule]) -> dict[str, ClassSchedulingRule]:
+        if len(value) > 500:
+            raise ValueError("班级调度配置数量不能超过 500")
+        for code in value:
+            if not 1 <= len(code) <= 80:
+                raise ValueError("班级代码长度必须在 1 到 80 个字符之间")
+        return value
 
 
 class TaskResult(BaseModel):

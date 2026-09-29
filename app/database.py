@@ -293,6 +293,31 @@ CREATE TABLE IF NOT EXISTS compute_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_compute_interventions_task ON compute_interventions(task_id,id);
+
+CREATE TABLE IF NOT EXISTS compute_scheduling_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version INTEGER NOT NULL UNIQUE,
+    default_weight REAL NOT NULL CHECK(default_weight > 0),
+    default_max_concurrent INTEGER CHECK(default_max_concurrent IS NULL OR default_max_concurrent >= 0),
+    aging_rate_per_hour REAL NOT NULL CHECK(aging_rate_per_hour >= 0),
+    aging_max_bonus REAL NOT NULL CHECK(aging_max_bonus >= 0),
+    classes_json TEXT NOT NULL DEFAULT '{}',
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS compute_claim_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    policy_version INTEGER NOT NULL,
+    policy_snapshot_json TEXT NOT NULL,
+    chosen_task_id INTEGER,
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_claim_decisions_created ON compute_claim_decisions(id DESC);
+CREATE INDEX IF NOT EXISTS idx_claim_decisions_task ON compute_claim_decisions(chosen_task_id);
 '''
 
 PERMISSIONS = [

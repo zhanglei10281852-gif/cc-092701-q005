@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 from app.compute.repository import ComputeRepository
+from app.compute.scheduling import SKIP_CLAIM_RACE_LOST, SchedulingPolicy, default_policy, policy_from_row, rank_candidates
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
@@ -47,6 +48,61 @@ class ComputeOperationsService:
         with transaction(immediate=True) as connection:
             return ComputeRepository(connection).upsert_quota(actor=actor, now=now, **payload)
 
+    def set_scheduling_policy(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+        """写入新的调度策略版本。历史版本只读，配置变更只影响后续领取决策。"""
+        now = to_storage(self.clock.now())
+        classes = {
+            code: {key: value for key, value in rule.items() if value is not None}
+            for code, rule in payload["classes"].items()
+        }
+        with transaction(immediate=True) as connection:
+            row = ComputeRepository(connection).create_policy(
+                default_weight=payload["default_weight"],
+                default_max_concurrent=payload["default_max_concurrent"],
+                aging_rate_per_hour=payload["aging_rate_per_hour"],
+                aging_max_bonus=payload["aging_max_bonus"],
+                classes=classes,
+                actor=actor,
+                now=now,
+            )
+            return self._policy_view(row)
+
+    def current_scheduling_policy(self) -> dict[str, Any]:
+        row = self.repository.current_policy_row()
+        if row is None:
+            policy = default_policy()
+            return {
+                "id": None,
+                "version": policy.version,
+                "default_weight": policy.default_weight,
+                "default_max_concurrent": policy.default_max_concurrent,
+                "aging_rate_per_hour": policy.aging_rate_per_hour,
+                "aging_max_bonus": policy.aging_max_bonus,
+                "classes": {},
+                "updated_by": "",
+                "created_at": "",
+            }
+        return self._policy_view(dict(row))
+
+    def scheduling_policy_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        return [self._policy_view(row) for row in self.repository.policy_history(max(1, min(limit, 200)))]
+
+    def list_claim_decisions(self, *, worker_id: str | None = None, task_id: int | None = None, chosen_only: bool = False, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.repository.list_claim_decisions(worker_id=worker_id, task_id=task_id, chosen_only=chosen_only, limit=max(1, min(limit, 500)))
+        for row in rows:
+            row["capabilities"] = json.loads(row.pop("capabilities_json"))
+        return rows
+
+    def get_claim_decision(self, decision_id: int) -> dict[str, Any]:
+        row = self.repository.claim_decision_by_id(decision_id)
+        if row is None:
+            raise NotFoundError("领取决策记录不存在")
+        view = dict(row)
+        view["capabilities"] = json.loads(view.pop("capabilities_json"))
+        view["policy_snapshot"] = json.loads(view.pop("policy_snapshot_json"))
+        view["candidates"] = json.loads(view.pop("candidates_json"))
+        return view
+
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
@@ -86,18 +142,42 @@ class ComputeOperationsService:
         now_value = self.clock.now()
         now = to_storage(now_value)
         lease_until = to_storage(now_value + timedelta(seconds=lease_seconds))
+        capability_list = sorted(set(capabilities))
         with transaction(immediate=True) as connection:
             repository = ComputeRepository(connection)
-            candidate = repository.queued_candidate(capabilities, now)
-            if candidate is None:
-                return None
-            cursor = connection.execute(
-                "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
-                (worker_id, lease_until, now, now, candidate["id"]),
+            policy = self._current_policy(repository)
+            candidates = rank_candidates(
+                repository.queued_available_tasks(now),
+                policy=policy,
+                now=now_value,
+                running_counts=repository.running_counts_by_class(),
+                capabilities=capability_list,
             )
-            if cursor.rowcount != 1:
-                return None
-            return dict(repository.task_by_id(candidate["id"]))
+            chosen: dict[str, Any] | None = None
+            for entry in candidates:
+                if not entry["eligible"]:
+                    continue
+                cursor = connection.execute(
+                    "UPDATE compute_tasks SET status='running',attempt_count=attempt_count+1,lease_owner=?,lease_expires_at=?,started_at=COALESCE(started_at,?),updated_at=?,version=version+1 WHERE id=? AND status='queued'",
+                    (worker_id, lease_until, now, now, entry["task_id"]),
+                )
+                if cursor.rowcount != 1:
+                    entry["eligible"] = False
+                    entry["skip_reason"] = SKIP_CLAIM_RACE_LOST
+                    continue
+                chosen = dict(repository.task_by_id(entry["task_id"]))
+                break
+            decision_id = repository.add_claim_decision(
+                worker_id=worker_id,
+                capabilities=capability_list,
+                policy_snapshot=policy.snapshot(),
+                chosen_task_id=None if chosen is None else int(chosen["id"]),
+                candidates=candidates,
+                now=now,
+            )
+            if chosen is not None:
+                chosen["claim_decision_id"] = decision_id
+            return chosen
 
     def heartbeat(self, task_id: int, worker_id: str, lease_seconds: int) -> dict[str, Any]:
         now_value = self.clock.now()
@@ -234,6 +314,19 @@ class ComputeOperationsService:
             raise ConflictError("当前任务状态不允许取消")
         status = "cancel_requested" if task["status"] == "running" else "cancelled"
         connection.execute("UPDATE compute_tasks SET status=?,finished_at=?,updated_at=?,version=version+1 WHERE id=?", (status, None if status == "cancel_requested" else now, now, task["id"]))
+
+    @staticmethod
+    def _current_policy(repository: ComputeRepository) -> SchedulingPolicy:
+        row = repository.current_policy_row()
+        if row is None:
+            return default_policy()
+        return policy_from_row(row)
+
+    @staticmethod
+    def _policy_view(row: dict[str, Any]) -> dict[str, Any]:
+        view = dict(row)
+        view["classes"] = json.loads(view.pop("classes_json"))
+        return view
 
     def _check_quota(self, repository: ComputeRepository, requested_by: str, now: datetime) -> None:
         quota = repository.quota("user", requested_by)

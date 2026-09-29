@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query
 
-from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
+from app.compute.schemas import BatchOperation, CancelRequest, PriorityRequest, QuotaSet, RetryRequest, SchedulingPolicySet, TaskClaim, TaskFailure, TaskResult, TaskSubmit, TemplateCreate
 from app.compute.service import ComputeOperationsService
 
 router = APIRouter(prefix="/api/compute", tags=["科学计算任务运营"])
@@ -25,6 +25,31 @@ def create_template(payload: TemplateCreate, actor: str = Query(..., min_length=
 @router.put("/quotas")
 def set_quota(payload: QuotaSet, actor: str = Query(..., min_length=1)):
     return service().set_quota(payload.model_dump(), actor)
+
+
+@router.put("/scheduling-policy")
+def set_scheduling_policy(payload: SchedulingPolicySet, actor: str = Query(..., min_length=1)):
+    return service().set_scheduling_policy(payload.model_dump(), actor)
+
+
+@router.get("/scheduling-policy")
+def get_scheduling_policy():
+    return service().current_scheduling_policy()
+
+
+@router.get("/scheduling-policy/history")
+def scheduling_policy_history(limit: int = Query(default=20, ge=1, le=200)):
+    return {"items": service().scheduling_policy_history(limit)}
+
+
+@router.get("/claim-decisions")
+def list_claim_decisions(worker_id: str | None = None, task_id: int | None = None, chosen_only: bool = False, limit: int = Query(default=100, ge=1, le=500)):
+    return {"items": service().list_claim_decisions(worker_id=worker_id, task_id=task_id, chosen_only=chosen_only, limit=limit)}
+
+
+@router.get("/claim-decisions/{decision_id}")
+def get_claim_decision(decision_id: int):
+    return service().get_claim_decision(decision_id)
 
 
 @router.post("/tasks", status_code=202)
